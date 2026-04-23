@@ -9,6 +9,10 @@ license.workspace = true
 name = "client"
 path = "src/main.rs"
 
+[[bin]]
+name = "group_demo"
+path = "src/group_demo.rs"
+
 [dependencies]
 crypto = { path = "../crypto" }
 tokio = { workspace = true }

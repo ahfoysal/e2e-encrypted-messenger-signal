@@ -9,6 +9,8 @@ pub mod x3dh;
 pub mod ratchet;
 pub mod signed_prekey;
 pub mod wire;
+pub mod sender_keys;
+pub mod group;
 
 pub use x3dh::{
     IdentityKey, PreKeyBundle, SignedPreKey, OneTimePreKey, X3dhError,

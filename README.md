@@ -123,10 +123,77 @@ cargo run --bin client -- --name alice --peer bob --relay ws://127.0.0.1:9000
 Type lines in either terminal — they appear decrypted as `<sender> text`
 in the peer's terminal. The relay only ever sees base64 ciphertext.
 
-### Next (M3 and beyond)
+## M3 Status — DONE (group messaging via Sender Keys)
+
+M3 ships group messaging using the **Sender Keys** scheme — what Signal
+actually ships for groups today. (Full MLS/RFC 9420 is deferred; Sender
+Keys gives the same E2E security with a smaller implementation.)
+
+- **`mvp/crypto/src/sender_keys.rs`** — each group member owns a
+  `SenderKey = (chain_key, Ed25519 signing keypair)` per group. The chain
+  key advances per message using the same `HMAC-SHA256(ck, 0x01/0x02)`
+  construction as the Double Ratchet's sending chain. Every group
+  ciphertext is signed with the member's Ed25519 key so other members
+  authenticate the origin even though they all hold the symmetric chain
+  state. A receiver-side `SenderKeyReceiver` verifies signatures first,
+  caches out-of-order message keys (up to `GROUP_MAX_SKIP = 64`), and
+  rejects replays / forged signatures / tampered ciphertexts.
+
+- **`mvp/crypto/src/group.rs`** — `GroupSession` composes one
+  `SenderKey` (self) + one `SenderKeyReceiver` per peer. API:
+  `create`, `join`, `encrypt`, `decrypt`, `add_member`, `remove_member`.
+  **Add** sends the adder's current SenderKey to the new member (no
+  rotation — historical ciphertexts aren't leaked). **Remove** rotates
+  the remover's SenderKey so the evicted member can't decrypt future
+  broadcasts (post-compromise security at membership-change granularity).
+  Transport assumption: `SenderKeyDistribution` blobs travel over the
+  already-established pairwise Double Ratchet sessions from M1/M2.
+
+- **`mvp/client/src/group_demo.rs`** — `cargo run --bin group_demo`
+  runs an in-process 3-member group (Alice, Bob, Carol), exchanges
+  round-robin messages, adds a 4th member (Dave), then removes one and
+  shows post-removal messages still decrypt for the remaining members.
+
+### Tests (M3)
+
+11 new tests, 25 total, all passing:
+
+- `sender_keys::send_recv_roundtrip`, `multiple_in_order_messages`,
+  `out_of_order_works`, `forged_signature_rejected`,
+  `tampered_ciphertext_rejected`, `wrong_sender_key_rejected`.
+- `group::three_member_group_exchanges_messages` — Alice/Bob/Carol all
+  send and converge on the same plaintext.
+- `group::adding_fourth_member_works` — Dave joins, all 4 exchange.
+- `group::removed_member_cannot_decrypt_new_messages` — Carol is
+  removed; her stale receiver state cannot decrypt Alice's post-rotation
+  broadcast (signature + chain key both change).
+- `group::member_not_in_group_cannot_be_removed`,
+  `group::duplicate_add_is_rejected` — membership invariants.
+
+### Run M3
+
+```bash
+cd mvp
+cargo test                    # 25 tests (M1 + M2 + M3)
+cargo run --bin group_demo    # in-process 3-member group demo
+cargo run --bin group_demo -- --members alice,bob,carol,eve
+```
+
+### M3 simplifications (vs. Signal's production Sender Keys)
+- Group transport is modeled in-process — a real deployment wraps each
+  `SenderKeyDistribution` in a 1:1 Double Ratchet envelope before the
+  relay forwards it.
+- No epoch/version numbers on distribution messages; the latest install
+  for a (group, sender) simply overwrites prior state.
+- Remove rotates only the caller's own key; every remaining member must
+  independently call `remove_member` to rotate theirs.
+- Relay still treats group broadcasts as N separate envelopes — no
+  fan-out optimization.
+
+### Next (M4 and beyond)
 - Multi-device (linked devices + key sync via encrypted channel).
 - Persistent session state (SQLite).
-- Group messaging via MLS (RFC 9420).
+- Full MLS (RFC 9420) with TreeKEM for larger groups.
 - Sealed sender + metadata-minimizing server.
 
 ## Key References
