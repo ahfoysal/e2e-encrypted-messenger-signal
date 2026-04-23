@@ -7,9 +7,15 @@
 
 pub mod x3dh;
 pub mod ratchet;
+pub mod signed_prekey;
+pub mod wire;
 
-pub use x3dh::{IdentityKey, PreKeyBundle, SignedPreKey, OneTimePreKey, x3dh_initiator, x3dh_responder};
+pub use x3dh::{
+    IdentityKey, PreKeyBundle, SignedPreKey, OneTimePreKey, X3dhError,
+    x3dh_initiator, x3dh_responder,
+};
 pub use ratchet::{RatchetState, RatchetHeader, RatchetMessage};
+pub use signed_prekey::{IdentitySigningKey, SpkSigError, verify_spk_signature};
 
 use thiserror::Error;
 

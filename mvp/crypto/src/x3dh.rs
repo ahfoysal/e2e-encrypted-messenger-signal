@@ -14,14 +14,18 @@
 //!
 //! Bob reconstructs the same using his private keys and Alice's public IK_A, EK_A.
 //!
-//! NOTE: For MVP we skip the XEd25519 signature on SPK. In production the
-//! initiator MUST verify Sig(IK_B, Encode(SPK_B)) before proceeding.
+//! M2: The initiator now verifies an Ed25519 signature on the SPK (by the
+//! responder's identity signing key) before running X3DH. Bundles without
+//! a valid signature are rejected with `X3dhError::BadSpkSignature`.
 
+use ed25519_dalek::{Signature, VerifyingKey};
 use hkdf::Hkdf;
 use rand_core::OsRng;
 use sha2::Sha256;
 use x25519_dalek::{PublicKey, StaticSecret};
 use zeroize::Zeroize;
+
+use crate::signed_prekey::verify_spk_signature;
 
 /// Long-term identity key (X25519 for MVP; real Signal uses XEd25519).
 pub struct IdentityKey {
@@ -66,11 +70,24 @@ impl OneTimePreKey {
 }
 
 /// Bob's published pre-key bundle (public material only).
+///
+/// In M2 the bundle now carries:
+///   - `identity_signing`: Ed25519 long-term verifying key
+///   - `spk_signature`: Ed25519 signature of `signed_prekey`'s bytes
+/// The initiator verifies the signature before running X3DH.
 #[derive(Clone)]
 pub struct PreKeyBundle {
     pub identity: PublicKey,
+    pub identity_signing: VerifyingKey,
     pub signed_prekey: PublicKey,
+    pub spk_signature: Signature,
     pub one_time_prekey: PublicKey,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum X3dhError {
+    #[error("signed pre-key signature did not verify")]
+    BadSpkSignature,
 }
 
 /// Output of X3DH: the 32-byte shared secret + the ephemeral public for the responder.
@@ -98,7 +115,15 @@ fn kdf(ikm: &[u8]) -> [u8; 32] {
 pub fn x3dh_initiator(
     alice_ik: &IdentityKey,
     bob_bundle: &PreKeyBundle,
-) -> X3dhInitiatorOutput {
+) -> Result<X3dhInitiatorOutput, X3dhError> {
+    // M2: verify SPK signature before trusting anything in the bundle.
+    verify_spk_signature(
+        &bob_bundle.identity_signing,
+        &bob_bundle.signed_prekey,
+        &bob_bundle.spk_signature,
+    )
+    .map_err(|_| X3dhError::BadSpkSignature)?;
+
     let ek = StaticSecret::random_from_rng(OsRng);
     let ek_pub = PublicKey::from(&ek);
 
@@ -116,7 +141,7 @@ pub fn x3dh_initiator(
     let sk = kdf(&ikm);
     ikm.zeroize();
 
-    X3dhInitiatorOutput { shared_secret: sk, ephemeral_public: ek_pub }
+    Ok(X3dhInitiatorOutput { shared_secret: sk, ephemeral_public: ek_pub })
 }
 
 /// Bob side of X3DH. Given his private keys and Alice's public IK + EK,
@@ -148,20 +173,33 @@ pub fn x3dh_responder(
 mod tests {
     use super::*;
 
+    fn make_bundle(
+        bob_ik: &IdentityKey,
+        bob_id_sign: &crate::signed_prekey::IdentitySigningKey,
+        bob_spk: &SignedPreKey,
+        bob_opk: &OneTimePreKey,
+    ) -> PreKeyBundle {
+        let sig = bob_id_sign.sign_spk(&bob_spk.public);
+        PreKeyBundle {
+            identity: bob_ik.public,
+            identity_signing: bob_id_sign.verifying,
+            signed_prekey: bob_spk.public,
+            spk_signature: sig,
+            one_time_prekey: bob_opk.public,
+        }
+    }
+
     #[test]
     fn x3dh_produces_same_shared_secret_on_both_sides() {
         let alice_ik = IdentityKey::generate();
         let bob_ik = IdentityKey::generate();
+        let bob_id_sign = crate::signed_prekey::IdentitySigningKey::generate();
         let bob_spk = SignedPreKey::generate();
         let bob_opk = OneTimePreKey::generate();
 
-        let bundle = PreKeyBundle {
-            identity: bob_ik.public,
-            signed_prekey: bob_spk.public,
-            one_time_prekey: bob_opk.public,
-        };
+        let bundle = make_bundle(&bob_ik, &bob_id_sign, &bob_spk, &bob_opk);
 
-        let out = x3dh_initiator(&alice_ik, &bundle);
+        let out = x3dh_initiator(&alice_ik, &bundle).unwrap();
         let bob_sk = x3dh_responder(
             &bob_ik,
             &bob_spk,
@@ -177,17 +215,64 @@ mod tests {
     fn x3dh_different_ephemerals_produce_different_secrets() {
         let alice_ik = IdentityKey::generate();
         let bob_ik = IdentityKey::generate();
+        let bob_id_sign = crate::signed_prekey::IdentitySigningKey::generate();
         let bob_spk = SignedPreKey::generate();
         let bob_opk = OneTimePreKey::generate();
 
+        let bundle = make_bundle(&bob_ik, &bob_id_sign, &bob_spk, &bob_opk);
+
+        let a = x3dh_initiator(&alice_ik, &bundle).unwrap();
+        let b = x3dh_initiator(&alice_ik, &bundle).unwrap();
+        assert_ne!(a.shared_secret, b.shared_secret);
+    }
+
+    #[test]
+    fn x3dh_rejects_invalid_spk_signature() {
+        let alice_ik = IdentityKey::generate();
+        let bob_ik = IdentityKey::generate();
+        let bob_id_sign = crate::signed_prekey::IdentitySigningKey::generate();
+        let attacker_id_sign = crate::signed_prekey::IdentitySigningKey::generate();
+        let bob_spk = SignedPreKey::generate();
+        let bob_opk = OneTimePreKey::generate();
+
+        // Bundle carries Bob's identity but a signature made by an attacker.
+        let bad_sig = attacker_id_sign.sign_spk(&bob_spk.public);
         let bundle = PreKeyBundle {
             identity: bob_ik.public,
+            identity_signing: bob_id_sign.verifying,
             signed_prekey: bob_spk.public,
+            spk_signature: bad_sig,
             one_time_prekey: bob_opk.public,
         };
 
-        let a = x3dh_initiator(&alice_ik, &bundle);
-        let b = x3dh_initiator(&alice_ik, &bundle);
-        assert_ne!(a.shared_secret, b.shared_secret);
+        assert!(matches!(
+            x3dh_initiator(&alice_ik, &bundle),
+            Err(X3dhError::BadSpkSignature)
+        ));
+    }
+
+    #[test]
+    fn x3dh_rejects_tampered_spk() {
+        let alice_ik = IdentityKey::generate();
+        let bob_ik = IdentityKey::generate();
+        let bob_id_sign = crate::signed_prekey::IdentitySigningKey::generate();
+        let bob_spk = SignedPreKey::generate();
+        let attacker_spk = SignedPreKey::generate();
+        let bob_opk = OneTimePreKey::generate();
+
+        // Honest sig over Bob's real SPK, but attacker substitutes the SPK.
+        let real_sig = bob_id_sign.sign_spk(&bob_spk.public);
+        let bundle = PreKeyBundle {
+            identity: bob_ik.public,
+            identity_signing: bob_id_sign.verifying,
+            signed_prekey: attacker_spk.public,
+            spk_signature: real_sig,
+            one_time_prekey: bob_opk.public,
+        };
+
+        assert!(matches!(
+            x3dh_initiator(&alice_ik, &bundle),
+            Err(X3dhError::BadSpkSignature)
+        ));
     }
 }

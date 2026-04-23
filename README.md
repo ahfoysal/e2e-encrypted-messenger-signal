@@ -28,7 +28,7 @@ The `mvp/` cargo workspace ships the M1 crypto core:
 
 ```bash
 cd mvp
-cargo test          # 6 tests: X3DH agreement, round-trip, tampering, key rotation, burst send
+cargo test          # 14 tests (M1 + M2): X3DH + SPK-sig + round-trip + out-of-order + DH-rotation
 cargo run --bin demo
 ```
 
@@ -47,16 +47,87 @@ Sample output:
 ```
 
 ### MVP simplifications (not production-ready)
-- SPK signature omitted (real X3DH requires `XEdDSA(IK_B, SPK_B)` verified before use).
-- No skipped-message cache → strict in-order delivery between DH ratchet steps.
-- No header encryption; no serialization format; no replay-window beyond per-chain counters.
-- Identity key is plain X25519; Signal uses XEd25519 so the same key does both DH and signatures.
+- Identity-signing key is a separate Ed25519 keypair (we don't implement XEd25519's
+  single-key trick — the security property is the same).
+- No header encryption; no replay-window beyond per-chain counters.
+- No persistent session state (sessions live only in memory).
+- Relay has no auth/TLS — any client can claim any handle.
 
-### Next (M1 remainder → M2)
-- WebSocket relay (`mvp/relay/`) + two-process CLI clients.
-- Out-of-order / skipped-key handling.
+## M2 Status — DONE (crypto hardening + WebSocket relay + CLI clients)
+
+M2 ships:
+
+- **`mvp/crypto/src/signed_prekey.rs`** — Ed25519 `IdentitySigningKey`.
+  The responder signs the X25519 signed-prekey public with its long-term
+  Ed25519 key. `PreKeyBundle` now carries `identity_signing` + `spk_signature`,
+  and `x3dh_initiator` **verifies the signature before running X3DH**,
+  returning `X3dhError::BadSpkSignature` on failure. This blocks the
+  "swap the SPK" attack where a MITM substitutes a pre-key bundle.
+
+- **Skipped-message key cache** in `ratchet.rs`. The receiver now tolerates
+  out-of-order delivery by deriving and caching the message keys for any
+  gap (up to `MAX_SKIP = 64` keys, FIFO-evicted). Handles both in-chain
+  gaps and the cross-chain case where a late message from the *previous*
+  sending chain arrives after a DH ratchet step (keys are cached against
+  the old remote DH pub so they still decrypt).
+
+- **`mvp/relay/`** — dumb WebSocket relay (`tokio` + `tokio-tungstenite`).
+  Caches per-handle pre-key bundles, routes opaque `Envelope`s between
+  two connected clients. Sees only base64 ciphertext + public keys.
+
+- **`mvp/client/`** — interactive CLI. Publishes its own bundle, fetches
+  the peer's bundle, runs X3DH, then reads stdin line-by-line — each line
+  is encrypted through the Double Ratchet and sent as an `Envelope`.
+  Incoming `Deliver` messages are decrypted and printed.
+
+- **`mvp/crypto/src/wire.rs`** — serde-serializable wire types
+  (`BundleWire`, `MessageWire`, `RelayMsg`) with base64 key/ciphertext encoding.
+
+### Tests (M2)
+
+14 tests total, all passing:
+
+- `signed_prekey::valid_signature_verifies` / `tampered_spk_is_rejected` /
+  `wrong_identity_is_rejected`
+- `x3dh::x3dh_rejects_invalid_spk_signature` — attacker's signature on a
+  real SPK is rejected
+- `x3dh::x3dh_rejects_tampered_spk` — honest signature + swapped SPK rejected
+- `ratchet::out_of_order_same_chain_decrypts` — receive 0, 2, 1, 3
+- `ratchet::out_of_order_across_dh_ratchet` — late message from the
+  *old* chain still decrypts after peer ratchets
+- `ratchet::gap_larger_than_max_skip_is_rejected` — safety bound
+- Plus the five M1 tests (round-trip, tampering, ping-pong DH rotation,
+  multi-send, dual-direction X3DH).
+
+### Run M2
+
+Terminal 1 — relay:
+
+```bash
+cd mvp
+cargo run --bin relay -- 127.0.0.1:9000
+```
+
+Terminal 2 — Bob (waits for Alice):
+
+```bash
+cargo run --bin client -- --name bob --peer alice --relay ws://127.0.0.1:9000
+```
+
+Terminal 3 — Alice (initiates):
+
+```bash
+cargo run --bin client -- --name alice --peer bob --relay ws://127.0.0.1:9000
+```
+
+Type lines in either terminal — they appear decrypted as `<sender> text`
+in the peer's terminal. The relay only ever sees base64 ciphertext.
+
+### Next (M3 and beyond)
+- Multi-device (linked devices + key sync via encrypted channel).
 - Persistent session state (SQLite).
-- XEdDSA signatures on SPK.
+- Group messaging via MLS (RFC 9420).
+- Sealed sender + metadata-minimizing server.
 
 ## Key References
 - Signal Protocol docs (X3DH, Double Ratchet specs)

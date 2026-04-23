@@ -5,6 +5,7 @@
 
 use crypto::{
     ratchet::RatchetState,
+    signed_prekey::IdentitySigningKey,
     x3dh::{
         x3dh_initiator, x3dh_responder, IdentityKey, OneTimePreKey, PreKeyBundle, SignedPreKey,
     },
@@ -23,17 +24,21 @@ fn main() {
 
     // --- Bob generates long-term + prekey material and publishes a bundle.
     let bob_ik = IdentityKey::generate();
+    let bob_id_sign = IdentitySigningKey::generate();
     let bob_spk = SignedPreKey::generate();
     let bob_opk = OneTimePreKey::generate();
+    let spk_sig = bob_id_sign.sign_spk(&bob_spk.public);
     let bundle = PreKeyBundle {
         identity: bob_ik.public,
+        identity_signing: bob_id_sign.verifying,
         signed_prekey: bob_spk.public,
+        spk_signature: spk_sig,
         one_time_prekey: bob_opk.public,
     };
 
     // --- Alice has an identity key and runs X3DH against Bob's bundle.
     let alice_ik = IdentityKey::generate();
-    let out = x3dh_initiator(&alice_ik, &bundle);
+    let out = x3dh_initiator(&alice_ik, &bundle).expect("SPK signature valid");
 
     // --- Bob receives (alice_ik_pub, ek_pub) and derives the same secret.
     let bob_sk = x3dh_responder(

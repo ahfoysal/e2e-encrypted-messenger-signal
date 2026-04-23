@@ -11,10 +11,18 @@
 //! generate our own fresh DH key -> new RK + new CKs. This gives per-message
 //! forward secrecy and post-compromise security.
 //!
-//! MVP simplifications:
-//!   - No skipped message cache (messages must be delivered in order).
+//! M2 additions:
+//!   - **Skipped-message key cache** (up to `MAX_SKIP = 64` keys per chain).
+//!     When a message arrives out of order, we derive and cache the message
+//!     keys for the gap so they can decrypt the missing messages when they
+//!     finally arrive. Also handles the cross-chain case: when a new DH pub
+//!     lands, any remaining keys in the old receiving chain are cached
+//!     against the *old* remote DH pub before ratcheting.
+//!
+//! Still simplified:
 //!   - No header encryption.
 //!   - AD (associated data) is a fixed constant.
+//!   - Cache is a simple FIFO evicting at MAX_SKIP entries.
 
 use chacha20poly1305::{
     aead::{Aead, KeyInit, Payload},
@@ -27,12 +35,16 @@ use sha2::Sha256;
 use x25519_dalek::{PublicKey, StaticSecret};
 use zeroize::Zeroize;
 
+use std::collections::VecDeque;
+
 use crate::CryptoError;
 
 type HmacSha256 = Hmac<Sha256>;
 
 const KDF_RK_INFO: &[u8] = b"Signal-MVP-Ratchet-RK-v1";
 const AD: &[u8] = b"Signal-MVP-AD";
+/// Maximum number of skipped message keys retained across all chains.
+pub const MAX_SKIP: usize = 64;
 
 /// Header sent alongside every ciphertext. Contains sender's current DH pub
 /// and the counter `n` within the current sending chain (used for nonce).
@@ -73,6 +85,17 @@ pub struct RatchetState {
     nr: u32,
     /// Messages sent in the *previous* sending chain.
     pns: u32,
+
+    /// Cache of skipped message keys, keyed by (sender_dh_pub, counter).
+    /// FIFO-evicted once `MAX_SKIP` entries are live.
+    skipped: VecDeque<SkippedEntry>,
+}
+
+#[derive(Clone)]
+struct SkippedEntry {
+    dh: [u8; 32],
+    n: u32,
+    mk: [u8; 32],
 }
 
 impl RatchetState {
@@ -97,6 +120,7 @@ impl RatchetState {
             ns: 0,
             nr: 0,
             pns: 0,
+            skipped: VecDeque::new(),
         }
     }
 
@@ -113,6 +137,7 @@ impl RatchetState {
             ns: 0,
             nr: 0,
             pns: 0,
+            skipped: VecDeque::new(),
         }
     }
 
@@ -137,16 +162,34 @@ impl RatchetState {
         Ok(RatchetMessage { header, ciphertext })
     }
 
-    /// Decrypt a message. Performs a DH ratchet step if the header carries a
-    /// new DH public key.
+    /// Decrypt a message. Handles three cases:
+    ///   1. The message was already "skipped" (its key is cached) -> use it.
+    ///   2. The header carries a new DH pub -> advance old chain into the
+    ///      skipped cache, DH-ratchet, then decrypt.
+    ///   3. Same chain but `n > nr` -> cache keys for the gap, then decrypt.
     pub fn decrypt(&mut self, msg: &RatchetMessage) -> Result<Vec<u8>, CryptoError> {
+        // 1. Try the skipped cache first.
+        if let Some(mk) = self.take_skipped(msg.header.dh.as_bytes(), msg.header.n) {
+            return aead_decrypt(&mk, msg.header.n, &msg.ciphertext);
+        }
+
         let need_ratchet = match self.dh_remote {
             Some(ref current) => current.as_bytes() != msg.header.dh.as_bytes(),
             None => true,
         };
+
         if need_ratchet {
+            // 2. Before rotating, drain any remaining messages in the *old*
+            //    receiving chain (up to header.pn) into the skipped cache,
+            //    keyed by the old remote DH pub.
+            if let Some(old_remote) = self.dh_remote {
+                self.skip_message_keys(old_remote.to_bytes(), msg.header.pn)?;
+            }
             self.dh_ratchet(&msg.header)?;
         }
+
+        // 3. Same chain: cache any keys for counters in [nr, msg.n).
+        self.skip_message_keys(msg.header.dh.to_bytes(), msg.header.n)?;
 
         let ckr = self.ckr.as_mut().ok_or(CryptoError::Kdf)?;
         let (next_ck, mk) = kdf_ck(ckr);
@@ -155,6 +198,43 @@ impl RatchetState {
         let pt = aead_decrypt(&mk, msg.header.n, &msg.ciphertext)?;
         self.nr += 1;
         Ok(pt)
+    }
+
+    /// Walk the current receiving chain forward until `self.nr == until`,
+    /// caching each derived message key under `dh` so the skipped messages
+    /// can still be decrypted when they arrive.
+    fn skip_message_keys(&mut self, dh: [u8; 32], until: u32) -> Result<(), CryptoError> {
+        if self.ckr.is_none() {
+            return Ok(());
+        }
+        if until.saturating_sub(self.nr) as usize > MAX_SKIP {
+            // Too big a gap — refuse rather than OOM.
+            return Err(CryptoError::InvalidMessage);
+        }
+        while self.nr < until {
+            let ckr = self.ckr.as_mut().ok_or(CryptoError::Kdf)?;
+            let (next_ck, mk) = kdf_ck(ckr);
+            *ckr = next_ck;
+            self.store_skipped(dh, self.nr, mk);
+            self.nr += 1;
+        }
+        Ok(())
+    }
+
+    fn store_skipped(&mut self, dh: [u8; 32], n: u32, mk: [u8; 32]) {
+        if self.skipped.len() >= MAX_SKIP {
+            // FIFO eviction — oldest skipped key drops.
+            self.skipped.pop_front();
+        }
+        self.skipped.push_back(SkippedEntry { dh, n, mk });
+    }
+
+    fn take_skipped(&mut self, dh: &[u8; 32], n: u32) -> Option<[u8; 32]> {
+        let pos = self
+            .skipped
+            .iter()
+            .position(|e| &e.dh == dh && e.n == n)?;
+        Some(self.skipped.remove(pos).unwrap().mk)
     }
 
     /// DH ratchet step triggered by receiving a new remote DH pub.
@@ -248,6 +328,7 @@ fn aead_decrypt(mk: &[u8; 32], n: u32, ct: &[u8]) -> Result<Vec<u8>, CryptoError
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::signed_prekey::IdentitySigningKey;
     use crate::x3dh::{
         x3dh_initiator, x3dh_responder, IdentityKey, OneTimePreKey, PreKeyBundle, SignedPreKey,
     };
@@ -255,16 +336,20 @@ mod tests {
     fn handshake() -> (RatchetState, RatchetState) {
         let alice_ik = IdentityKey::generate();
         let bob_ik = IdentityKey::generate();
+        let bob_id_sign = IdentitySigningKey::generate();
         let bob_spk = SignedPreKey::generate();
         let bob_opk = OneTimePreKey::generate();
 
+        let spk_sig = bob_id_sign.sign_spk(&bob_spk.public);
         let bundle = PreKeyBundle {
             identity: bob_ik.public,
+            identity_signing: bob_id_sign.verifying,
             signed_prekey: bob_spk.public,
+            spk_signature: spk_sig,
             one_time_prekey: bob_opk.public,
         };
 
-        let out = x3dh_initiator(&alice_ik, &bundle);
+        let out = x3dh_initiator(&alice_ik, &bundle).unwrap();
         let bob_sk = x3dh_responder(
             &bob_ik,
             &bob_spk,
@@ -325,6 +410,56 @@ mod tests {
         // flip a bit in the ciphertext
         msg.ciphertext[0] ^= 0x01;
         assert!(bob.decrypt(&msg).is_err());
+    }
+
+    #[test]
+    fn out_of_order_same_chain_decrypts() {
+        // Alice sends 4 messages; Bob receives them in order 0, 2, 1, 3.
+        let (mut alice, mut bob) = handshake();
+        let m0 = alice.encrypt(b"zero").unwrap();
+        let m1 = alice.encrypt(b"one").unwrap();
+        let m2 = alice.encrypt(b"two").unwrap();
+        let m3 = alice.encrypt(b"three").unwrap();
+
+        assert_eq!(bob.decrypt(&m0).unwrap(), b"zero");
+        // Skip m1 — decrypt m2 first. Bob should cache m1's key.
+        assert_eq!(bob.decrypt(&m2).unwrap(), b"two");
+        // Now the late m1 can still be decrypted from the cache.
+        assert_eq!(bob.decrypt(&m1).unwrap(), b"one");
+        assert_eq!(bob.decrypt(&m3).unwrap(), b"three");
+    }
+
+    #[test]
+    fn out_of_order_across_dh_ratchet() {
+        // Alice sends two, Bob only receives the 2nd; Alice then replies
+        // triggering a ratchet on Bob's side; the late 1st message from the
+        // old chain still decrypts from the skipped cache.
+        let (mut alice, mut bob) = handshake();
+        let late = alice.encrypt(b"late-from-old-chain").unwrap();
+        let m1 = alice.encrypt(b"second").unwrap();
+        // Bob gets m1 first (skips `late` with n=0).
+        assert_eq!(bob.decrypt(&m1).unwrap(), b"second");
+
+        // Bob replies -> rotates his DH key.
+        let b_reply = bob.encrypt(b"bob-reply").unwrap();
+        assert_eq!(alice.decrypt(&b_reply).unwrap(), b"bob-reply");
+
+        // Now the very-late `late` message from Alice's *previous* chain
+        // arrives. Its DH pub matches the old remote DH Bob cached against.
+        assert_eq!(bob.decrypt(&late).unwrap(), b"late-from-old-chain");
+    }
+
+    #[test]
+    fn gap_larger_than_max_skip_is_rejected() {
+        let (mut alice, mut bob) = handshake();
+        // Burn through MAX_SKIP + 2 messages on Alice's side.
+        let mut last = None;
+        for _ in 0..(MAX_SKIP + 2) {
+            last = Some(alice.encrypt(b"x").unwrap());
+        }
+        // Bob tries to jump to the last one, skipping MAX_SKIP+1 keys.
+        let err = bob.decrypt(&last.unwrap()).unwrap_err();
+        assert!(matches!(err, CryptoError::InvalidMessage));
     }
 
     #[test]
