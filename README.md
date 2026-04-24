@@ -196,6 +196,122 @@ cargo run --bin group_demo -- --members alice,bob,carol,eve
 - Full MLS (RFC 9420) with TreeKEM for larger groups.
 - Sealed sender + metadata-minimizing server.
 
+## M6 Status — DONE (full MLS / RFC 9420 group engine)
+
+M6 ships a hand-rolled **MLS (RFC 9420)** implementation as an alternative
+to Sender Keys for group messaging. Both engines coexist — a client
+picks one per-group via a flag. MLS brings asynchronous joins
+(Welcome messages), `O(log N)` commits via TreeKEM, and explicit
+epoch-based state transitions.
+
+New module tree:
+
+```
+mvp/crypto/src/mls/
+  mod.rs          // public surface: re-exports everything below
+  treekem.rs      // ratchet tree + path_secret derivation + resolution
+  keypackage.rs   // LeafNode + KeyPackage + self-signatures
+  messages.rs     // Proposal / Commit / Welcome / MlsApplicationMessage
+  group.rs        // MlsGroup state machine + mini-HPKE + key schedule
+```
+
+### What's implemented
+
+- **TreeKEM** (`treekem.rs`): left-balanced binary tree with MLS's array
+  indexing (leaves at even indices, internals at odd). `direct_path`,
+  `copath`, `resolution` (RFC 9420 §7.4 — descends into blank internal
+  nodes until it finds real public keys), and `derive_path` /
+  `apply_path` that produce **the same `commit_secret` on both sides**
+  of a commit (verified by `both_sides_derive_same_root_when_they_
+  share_subtree_secret`).
+- **LeafNode + KeyPackage** (`keypackage.rs`): Ed25519-signed member
+  "calling cards" carrying separate **encryption_key** (X25519, used
+  for TreeKEM direct-path at the leaf) and **init_key** (X25519, used
+  only for Welcome encryption). Self-signature prevents swapping.
+- **Proposals** (`messages.rs`): **Add { KeyPackage }** and
+  **Remove { leaf }**. (Update / ReInit / PSK / ExternalInit deferred.)
+- **Commit** (`messages.rs`, `group.rs::commit_add`, `commit_remove`):
+  signed by the committer, contains proposals + `UpdatePath`
+  (sender's new leaf public, `path_publics[i]`, and HPKE-wrapped
+  `path_secrets` addressed to the resolution of each co-path node).
+  `path_level` on each `HpkeCiphertext` tells the receiver which
+  direct-path index the secret seeds — so one commit can cover a
+  sibling subtree with multiple blank-descended targets.
+- **Welcome** (`messages.rs`, `group.rs::join_from_welcome`): the
+  committer encrypts the new epoch's `joiner_secret` to the added
+  member's `init_key`. The Welcome also carries the full public view of
+  the ratchet tree + roster so the joiner rebuilds local state
+  without knowing prior epochs' plaintexts.
+- **Epoch key schedule**: `commit_secret → HKDF-Expand("epoch" || gid
+  || epoch) → epoch_secret → HKDF-Expand("app" || leaf || gen) →
+  msg_key`. Every member re-derives the same `epoch_secret` after a
+  commit → direct equality test in the tests.
+- **Application messages** (`MlsApplicationMessage`): AEAD
+  (ChaCha20-Poly1305) under a per-(sender, generation) message key,
+  nonce = `leaf || 0..0 || gen`, and an Ed25519 signature under the
+  sender's signing key over the full TBS. Replay protection via
+  monotonic per-sender generations within the epoch.
+- **Mini-HPKE** for TreeKEM wrapping: X25519 ephemeral-static
+  + HKDF-SHA256 + ChaCha20-Poly1305. Not the full RFC 9180 framing —
+  close enough for the crypto core and documented as such.
+
+### Tests (M6)
+
+14 new tests, 62 in `crypto` total, all passing:
+
+- `mls::treekem::array_layout_four_leaves` — parent / sibling /
+  direct_path / copath match the RFC 9420 §4.2 array layout.
+- `mls::treekem::path_secret_advance_is_deterministic`.
+- `mls::treekem::derive_path_populates_tree`.
+- `mls::treekem::both_sides_derive_same_root_when_they_share_
+  subtree_secret` — **the core TreeKEM invariant**: given the right
+  injection secret, a receiver lands on the exact same
+  `commit_secret` the sender produced.
+- `mls::keypackage::generated_keypackage_verifies` /
+  `tampered_leaf_fails` / `tampered_init_key_fails`.
+- `mls::group::two_member_group_roundtrip` — Commit + Welcome end-to-
+  end; Bob encrypts back to Alice.
+- `mls::group::three_member_group_treekem_derives_same_root` —
+  Alice + Bob + Carol all converge on the same `epoch_secret` after
+  two Adds; each can broadcast and the other two decrypt.
+- `mls::group::four_member_group_with_remove_evicts` — grows the
+  tree cap from 2 to 4, adds Dave, then removes Carol. After the
+  Remove commit, Alice/Bob/Dave all converge on a new
+  `epoch_secret`; Carol is stuck at the prior epoch and **cannot
+  decrypt** new broadcasts.
+- `mls::group::tampered_application_rejected` /
+  `forged_signature_rejected` / `wrong_epoch_rejected` /
+  `duplicate_credential_rejected` — negative paths.
+
+### M6 simplifications / deferred items
+
+- **Scope**: 2..=16 member groups. Only **Add** and **Remove**
+  proposals. No **Update** (leaf refresh), **ReInit**,
+  **ExternalInit**, **PSK**, or external joiners. No commit batching
+  of multiple proposals from different senders.
+- **HPKE** is our own X25519 + HKDF + ChaCha20Poly1305 construction,
+  not the full RFC 9180 framing with KEM/KDF/AEAD ids + info contexts.
+- **Cipher suite is fixed** — corresponds loosely to MLS 0x0003
+  (`MLS_128_DHKEMX25519_CHACHA20POLY1305_SHA256_Ed25519`).
+- **No parent-hash chain / tree signatures** — we rely on the
+  committer's signature + each LeafNode's self-signature. RFC 9420's
+  `tree_hash` + `parent_hash` invariants are not enforced.
+- **No confirmation-tag / interim-transcript-hash chain** beyond the
+  commit signature.
+- **No on-wire MLS TLS-presentation framing** — we use
+  `serde_json` / `bincode` compatible serde.
+- **grow_tree** only copies leaf publics; interior nodes are
+  re-derived on the next commit. Works because every commit touches
+  the full direct path anyway.
+
+### Run M6
+
+```bash
+cd mvp
+cargo test           # 62 crypto + 6 relay tests, all passing
+cargo test mls       # just the MLS module (14 tests)
+```
+
 ## Key References
 - Signal Protocol docs (X3DH, Double Ratchet specs)
 - MLS RFC 9420

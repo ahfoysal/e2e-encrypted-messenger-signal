@@ -16,6 +16,7 @@ pub mod sealed_sender;
 pub mod multi_device;
 pub mod safety_numbers;
 pub mod disappearing;
+pub mod mls;
 
 pub use x3dh::{
     IdentityKey, PreKeyBundle, SignedPreKey, OneTimePreKey, X3dhError,
