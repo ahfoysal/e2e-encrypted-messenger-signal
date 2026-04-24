@@ -9,6 +9,10 @@ license.workspace = true
 name = "relay"
 path = "src/main.rs"
 
+[lib]
+name = "relay"
+path = "src/lib.rs"
+
 [dependencies]
 crypto = { path = "../crypto" }
 tokio = { workspace = true }
@@ -17,3 +21,7 @@ futures-util = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 anyhow = { workspace = true }
+sled = { workspace = true }
+tokio-rustls = { workspace = true }
+rustls = { workspace = true }
+rustls-pemfile = { workspace = true }

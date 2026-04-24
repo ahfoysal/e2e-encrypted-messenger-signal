@@ -47,6 +47,8 @@ use x25519_dalek::{PublicKey, StaticSecret};
 use crate::signed_prekey::IdentitySigningKey;
 use crate::x3dh::IdentityKey;
 
+use serde_big_array::BigArray;
+
 const SEALED_INFO: &[u8] = b"Signal-MVP-SealedSender-v1";
 const SEALED_AD: &[u8] = b"Signal-MVP-SealedSender-AD";
 const CERT_CONTEXT: &[u8] = b"Signal-MVP-SealedSender-Cert-v1";
@@ -63,6 +65,7 @@ pub struct SenderCertificate {
     pub sender_signing_vk: [u8; 32],
     /// Ed25519 signature over the canonical encoding of the other fields,
     /// produced by the private half of `sender_signing_vk`.
+    #[serde(with = "BigArray")]
     pub signature: [u8; 64],
 }
 

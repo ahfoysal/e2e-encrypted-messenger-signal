@@ -13,7 +13,7 @@ use crate::ratchet::{RatchetHeader, RatchetMessage};
 use crate::x3dh::PreKeyBundle;
 
 /// Wire-friendly version of `PreKeyBundle` — base64 strings all the way down.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct BundleWire {
     pub identity: String,
     pub identity_signing: String,
@@ -87,21 +87,55 @@ impl MessageWire {
 }
 
 /// Envelope exchanged between client and relay (and between clients via the relay).
+///
+/// M5: optional `device_id` (sender/recipient device selector for multi-device
+/// fan-out) and `expires_at_unix_ms` (disappearing-messages TTL). Both default
+/// to zero (= "unspecified" / "never") so pre-M5 clients stay compatible.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum RelayMsg {
     /// Client -> server: announce who I am.
-    Hello { who: String },
+    Hello {
+        who: String,
+        #[serde(default)]
+        device_id: u32,
+    },
     /// Client -> server: publish my pre-key bundle for others to fetch.
-    PublishBundle { who: String, bundle: BundleWire },
+    PublishBundle {
+        who: String,
+        bundle: BundleWire,
+        #[serde(default)]
+        device_id: u32,
+    },
     /// Client -> server: fetch `who`'s bundle.
     FetchBundle { who: String },
     /// Server -> client: requested bundle (or `None` if unknown).
-    Bundle { who: String, bundle: Option<BundleWire> },
+    Bundle {
+        who: String,
+        bundle: Option<BundleWire>,
+    },
     /// Client -> server: relay this message to `to`.
-    Envelope { from: String, to: String, msg: MessageWire },
+    Envelope {
+        from: String,
+        to: String,
+        msg: MessageWire,
+        #[serde(default)]
+        from_device: u32,
+        #[serde(default)]
+        to_device: u32,
+        /// Absolute unix-ms expiry; 0 = never expires.
+        #[serde(default)]
+        expires_at_unix_ms: u64,
+    },
     /// Server -> client: a message delivered from `from`.
-    Deliver { from: String, msg: MessageWire },
+    Deliver {
+        from: String,
+        msg: MessageWire,
+        #[serde(default)]
+        from_device: u32,
+        #[serde(default)]
+        expires_at_unix_ms: u64,
+    },
     /// Server -> client: protocol-level error (unknown peer, etc.).
     Error { reason: String },
 }
